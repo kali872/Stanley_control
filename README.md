@@ -205,17 +205,7 @@ launch 인자 `speed_limit_kmph`(0 = 상한 없음, 값을 주면 yaml 속도를
 | `stanley_dynamics_sim.launch.py` | 폐루프 시뮬레이션 (터미널 2) |
 | `path_tracking.launch.py` | 위 실차 launch가 내부에서 부르는 본체 (경로 발행 + 차량 상태 + `stanley_node`). 지우면 안 된다 |
 
-## 알려진 제약 (2026-09-20)
 
-- 조향 명령 한계 99°: 차량 PC의 `steering_teensy` 소스가 100° 초과 명령을 거부한다.
-  실측 road-wheel 우 11.7°(R 6.5 m) / 좌 15.2°(R 4.9 m). 이보다 급한 코너는 어떤 튜닝으로도 못 돈다. 펌웨어가 ±2.5 rad로 올라간 것이 확인되면
-  `vehicle.yaml`의 `max_steering_command_deg`를 143.2394488로.
-- 조향 실측표: ±1.73/±1.0 rad 4점은 bag 실측, 양 끝단은 09-19 수측정(영점 가정), 그 사이는 선형 보간.
-- `/wheel_sensor`는 3.6배 크게 나온다 (CAN 수신부 km/h→m/s 누락). 이 패키지는 쓰지 않는다.
-- 속도 보정(`speed_trim_*`)과 Stanley 게인(`cross_track_gain` 0.3, softening 10.8,
-  `heading_gain` 0.6), yaw 감쇠 0.15 s, lead 3°는 실측이 아닌 추정값. rosbag(`/target_angle` `/encoder` `/target_speed` `/ekf/odometry`)으로 맞춘다.
-- 맵 `20260919_121644`의 `.mm`은 차량 PC의 MOLA가 못 읽는다(직렬화 버전 6) — 경로 추종은 되지만
-  LiDAR 정합은 안 된다.
 
 ## 테스트
 
