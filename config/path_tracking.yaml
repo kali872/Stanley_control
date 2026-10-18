@@ -1,0 +1,601 @@
+# =============================================================================
+# 자주 만지는 값 — 증상별로 여기부터
+# =============================================================================
+#
+#   이 파일은 stanley_waypoint_follow.launch.py 가 읽는 파라미터 파일입니다.
+#   소스 폴더의 이 파일을 직접 읽으므로, 고치고 launch 만 다시 띄우면 됩니다
+#   (colcon build 불필요). 차량 제원/조향 변환은 config/vehicle.yaml.
+#
+#   직선 속도 (현재 20 km/h)        route_publisher_node.max_speed_kmph
+#   곡선 속도 (현재 10 km/h)        route_publisher_node.curve_max_speed_kmph / min_speed_kmph
+#   곡선 안에서 급한 코너 속도      route_publisher_node.max_lateral_accel_mps2 / min_speed_kmph
+#   출발/정지가 급하다              route_publisher_node.max_accel_mps2 / max_decel_mps2
+#   루프를 계속 돌게               route_publisher_node.loop_closure_max_gap_m: 10.0 (주석 참고)
+#
+#   경로 좌우로 흔들린다            stanley_node.heading_gain 먼저, 그다음 cross_track_gain (줄인다)
+#                                  + yaw_rate_damping_gain_s / max_steering_command_lead_deg (조향 모터 지연 보정)
+#   STOP NO_STEERING_FEEDBACK       /encoder 가 없음: CAN bridge 를 띄운다 (steering_feedback_required)
+#   RECOVERING / STOP RECOVERY_FAILED  corridor 밖에서 경로로 복귀 중 / 포기 (recovery_*)
+#   STOP HEADING_UNVERIFIED         ESKF heading 미확정 (/ekf/heading_verified=false): 정지 상태로 LiDAR 정합을 기다리거나 10 m 직진
+#   경로에 늦게 붙는다 / 바깥으로 돈다  stanley_node.cross_track_gain       (키운다)
+#   저속에서 조향이 과민하다        stanley_node.cross_track_softening_kmph (키운다)
+#   직선에서 핸들이 떨린다          stanley_node.heading_gain (줄인다) / heading_window_m (키운다)
+#   조향이 반대로 간다              stanley_node.steering_sign
+#   방향이 틀린 채 출발 금지 각도     stanley_node.max_heading_error_deg
+#   경로에서 벗어나면 정지하는 폭     stanley_node.corridor_half_width_m / stop_outside_corridor
+#   속도가 목표에 못 미친다          stanley_node.speed_trim_gain_per_s / speed_trim_max_kmph
+#   yaw가 안 잡혀 출발을 못 한다      stanley_node.heading_creep_* (NEEDS_MOTION일 때만 직진 크립)
+#
+#   launch 인자가 이 파일보다 우선하는 값 (stanley_waypoint_follow.launch.py):
+#     speed_limit_kmph:=20.0   전체 속도 상한. 위 max_speed_kmph 를 올려도 이 값에서 잘립니다
+#     goal_mode:=STOP_AT_END   경로 끝에서 감속 정지 (이 파일의 goal_mode 보다 우선)
+#     drive_enabled:=true      stanley_node 를 띄워 실제 명령을 냄
+#
+# 차량 자체의 값(축거, 조향 한계, 조향 각속도 한계)은 여기가 아니라
+# config/vehicle.yaml에 있습니다.
+#
+# 단위: 속도는 전부 km/h(`_kmph`)입니다. 노드가 파라미터를 읽는 그 지점에서
+# 한 번만 m/s로 바꾸고, 그 아래의 속도 프로파일과 Trajectory 메시지는 전부
+# SI(m/s)입니다. 가속도는 m/s^2 그대로입니다 — km/h/s는 쓰는 데가 없습니다.
+#
+# 2026-09-19 /target_speed 단위: 구동 MCU 는 km/h 를 받는데(브리지는 x100 만
+# 함) 이 패키지는 m/s 를 그대로 보내고 있었다. 이제 컨트롤러가 토픽으로 낼 때
+# 한 번 x3.6 한다(vehicle.speed_command_kmh). 이 파일의 값은 예전 그대로다:
+# *_kmph 는 km/h, *_mps2 는 m/s^2 (물리 단위). 여기서 3.6 이나 12.96 으로
+# 미리 나누면 이중 변환이 되어 직선 5 km/h, 가속 0.2 m/s^2 가 된다 (같은 날
+# 한 번 그렇게 됐었다).
+# =============================================================================
+
+route_publisher_node:
+  ros__parameters:
+    utm_frame: "utm"
+    # 웨이포인트는 UTM으로 저장되지만 발행 전에 로컬라이제이션 프레임으로
+    # 변환됩니다. UTM northing은 약 4e6 m라 단정밀도 사용 측에서 눈에 띄는
+    # 정밀도 손실이 발생합니다. 이는 맵핑 패키지가 `map`을 작업 프레임으로
+    # 선택한 것과 일치합니다.
+    output_frame: "map"
+    trajectory_topic: "/planning/trajectory"
+    corridor_half_width_m: 3.0
+
+    # FOLLOW_UNTIL_REPLACED(2026-09-17 설정): 목표 지점이 없습니다. 컨트롤러는
+    # 차량이 어디서 출발하든 가장 가까운 경로 구간부터 추종하며 정지 상태를
+    # 래치하지 않습니다. 경로 끝에서는 속도가 0까지 감소하고 마지막 1 m에서
+    # STOP END_OF_ROUTE를 유지합니다. 래치되지 않으므로 차량이 경로의 다른
+    # 위치로 이동하면 즉시 추종을 재개합니다. STOP_AT_END는 기존의 목표 정지와
+    # 래치 동작을 복원합니다(아래 goal_tolerance_m / restart_near_start_m 참고).
+    #
+    # 루프 폐쇄는 꺼져 있습니다(0.0). 시작점 근처로 돌아오는 경로도 처음부터
+    # 끝까지 한 번만 주행합니다. 10.0으로 설정하면 해당 경로를 폐루프로 연결해
+    # 정지할 때까지 반복 주행합니다. 단, 연결부는 실제 맵핑 주행에 없던 직선
+    # 지름길입니다. 20260914_220126에서는 경로 시작점과 51도 꺾여 연결되었고,
+    # 재생 시 Stanley의 헤딩 오차가 33도까지 증가했습니다. 시작점을 지나서까지
+    # 주행하며 기록한 맵에서만 사용할 가치가 있습니다.
+    goal_mode: "FOLLOW_UNTIL_REPLACED"
+    loop_closure_max_gap_m: 0.0
+    # 연결점을 찾을 때 시작점 이후와 끝점 이전을 탐색하는 거리입니다. 시작점에
+    # 못 미쳐 멈췄거나 시작점을 지나 계속 주행한 기록을 처리합니다.
+    loop_closure_search_m: 30.0
+    loop_closure_max_turn_deg: 60.0
+
+    # ---- 속도 -----------------------------------------------------------
+    # 직선 10~15 km/h, 곡선 5~10 km/h(2026-09-15 설정). 각 웨이포인트에서:
+    #
+    #   상한 = min(최고 속도, sqrt(최대 횡가속도 * R))
+    #          R < curve_radius_m이면 curve_max_speed로 제한
+    #          min_speed를 하한으로 적용
+    #   이후 제동(max_decel) 및 가속(max_accel) 램프로 구간을 연결합니다.
+    #
+    # R은 curvature_smoothing_window 적용 후의 회전반경입니다. 0.5 m/s^2일 때
+    # 3.7 m 코너(20260914_220126에서 가장 급한 코너)는 하한 5 km/h,
+    # 8 m는 7.2 km/h, 14.8 m는 10 km/h가 됩니다. curve_radius_m보다 급한
+    # 구간은 곡률이 완만해도 10 km/h 이하로 유지하고 직선은 15 km/h로
+    # 주행합니다. 직선에서 10~15 사이 값은 곡선 진입·이탈 램프입니다
+    # (2.0 m/s^2로 15 -> 10 km/h 감속 시 2.4 m 필요).
+    #
+    # 현재 경로 4개(20260913_101241, 20260913_103732, 20260914_215511,
+    # 20260914_220126)에서 측정한 결과 직선은 100%가 10~15 km/h,
+    # 곡선(R < 30 m)은 100%가 5~10 km/h 범위였습니다. 곡선 상한이 없으면
+    # 반경 15~34 m 굽은 구간에서 곡선 길이의 18~66%를 10~15 km/h로 주행했습니다.
+    #
+    # 이 프로파일에는 정지 상태 출발 램프가 없습니다. 첫 몇 m는 컨트롤러 자체의
+    # 시작 램프(아래 start_speed_kmph / start_accel_mps2)가 처리합니다.
+    max_speed_kmph: 50.0    # km/h(route_publisher/controllers에서 3.6으로 한 번 나눔. 미리 나누지 말 것)
+
+    # 곡선 내부의 5~10 km/h 범위를 결정합니다. 어떤 코너가 하한에 가깝고 어떤
+    # 코너가 상한에 가까운지를 정하며, 현재 값은 접지력 측정값이 아닙니다.
+    max_lateral_accel_mps2: 0.5    # m/s2 물리 단위. km/h 토픽 때문에 재환산하지 말 것
+
+    # 곡선 속도 상한입니다. 둘 다 설정하거나, 순수 접지력 공식만 쓰려면 둘 다
+    # 0으로 설정합니다. 2026-09-19: 코너는 10 km/h로 진입하고
+    # (= min_speed_kmph라 모든 곡선이 정확히 10으로 주행), 직선 속도
+    # 20 km/h로 이탈합니다. 아래 curve_exit_lead_m을 참고하십시오.
+    curve_max_speed_kmph: 25.0    # km/h(route_publisher/controllers에서 3.6으로 한 번 나눔. 미리 나누지 말 것)
+    curve_radius_m: 30.0
+
+    max_accel_mps2: 2.5    # m/s2 물리 단위. km/h 토픽 때문에 재환산하지 말 것
+    # 프로파일이 가정하는 차량 감속 능력입니다. 구동 MCU는 목표값이 낮아지면
+    # 스로틀만 줄이므로(P 제어, 브레이크 없음), 이는 제동 감속도가 아니라
+    # 타력주행 감속도입니다. 2026-09-19까지의 2.0은 코너 2.8 m 전에 램프를
+    # 시작했지만 차량은 진입 시 여전히 직선 속도였고 코너 출구에서야 곡선
+    # 속도에 도달했습니다. 0.5는 추정값입니다. 목표값을 낮춘 뒤의 속도 기울기를
+    # 측정해 그 값을 입력하십시오. 작을수록 감속을 일찍 시작합니다.
+    # 0.5일 때 20 -> 10 km/h 감속에는 23 m가 필요합니다.
+    max_decel_mps2: 0.5    # m/s2 물리 단위. km/h 토픽 때문에 재환산하지 말 것
+    # 위 램프에 더해 코너 진입 몇 m 전에 곡선 속도에 도달할지 정합니다.
+    # 프로파일은 이 지점부터 코너까지 곡선 속도를 유지하므로, 스로틀 지연과
+    # 다소 낙관적인 max_decel_mps2 때문에 감속 지점이 코너 안으로 밀리지
+    # 않습니다. 0이면 비활성화합니다.
+    curve_speed_lead_m: 3.0
+    # 코너를 직선 속도로 빠져나오기 위한 값입니다. 곡선 끝에서 이 거리 안에
+    # 들어오면(가장 급한 지점 이전에는 절대 적용하지 않음) 속도 상한을
+    # max_speed_kmph까지 해제합니다. 따라서 가속 램프가 코너 안에서 시작되고
+    # 출구에서 직선 속도로 복귀합니다. 10 -> 20 km/h 가속에는 1.5 m/s2에서
+    # 7.7 m, 2.5에서 4.6 m가 필요합니다. 정점에서 곡선 끝까지가 흔히 5~7 m라
+    # max_accel_mps2를 2.5로 설정했습니다. max_accel_mps2는 목표값의 기울기이며,
+    # 실제 가속도는 구동 MCU의 스로틀이 결정합니다. 0이면 곡선 이후 가속합니다.
+    # 2026-09-26: 10 -> 3. 이 경로의 코너는 6~14 m라 10이면 꼭짓점 직후부터
+    # 목표속도가 10~15 km/h로 올라가 출구에서 바깥으로 밀렸습니다
+    # (stanley_tuning_0926_202254: 모든 코너에서 최대 이탈이 코너 끝).
+    curve_exit_lead_m: 3.0
+
+    # 곡률 속도 상한에만 적용되는 하한입니다. 종점 정지 시에는 이 값을 지나
+    # 계속 0까지 감속합니다. curve_max_speed_kmph를 초과하면 안 됩니다.
+    # 2026-09-24: 10 -> 5. 10이면 반경 3.4~4.5 m 코너도 10 km/h(반경 3.4 m에서
+    # 횡가속도 2.3 m/s^2)였습니다. 5이면 max_lateral_accel_mps2 0.5가 코너 속도를
+    # 정합니다(R 3.4 m 5 km/h, R 8 m 7.2 km/h, R 15 m 10 km/h).
+    min_speed_kmph: 20.0    # km/h(route_publisher/controllers에서 3.6으로 한 번 나눔. 미리 나누지 말 것)
+
+    # ---- 경로 전처리 ----------------------------------------------------
+    # 이 웨이포인트는 실제 주행을 1 m마다 샘플링한 것이므로 운전자의 주행선과
+    # 로컬라이제이션의 샘플별 노이즈를 모두 포함합니다. 3점 곡률 계산은 두 번
+    # 미분하므로 둘 다 증폭합니다. 평활화하지 않으면 직선의 노이즈 때문에
+    # 감속합니다. 샘플 5개는 약 5 m입니다.
+    curvature_smoothing_window: 5
+
+    # 맵핑 중 로컬라이제이션이 튀면 기록 경로가 자기 자신을 거슬러 돌아갈 수
+    # 있습니다. waypoint_saver_node는 방향을 검사하지 않고 이동 거리 1 m마다
+    # 샘플링합니다. 호 길이 기반 전방주시점은 역방향 폴리라인을 따라갈 수
+    # 없으므로 해당 웨이포인트를 평활화하지 않고 경고와 함께 제거합니다.
+    # 100도는 차량이 실제로 주행할 수 있는 모든 코너는 통과시키면서 점프가
+    # 만드는 약 170도 이탈은 검출합니다. 0이면 필터를 비활성화합니다.
+    max_route_reversal_deg: 100.0
+    min_waypoint_spacing_m: 0.05
+
+    # ---- 생존성 ---------------------------------------------------------
+    publish_period_sec: 0.5
+    # publish_period_sec보다 커야 합니다. 컨트롤러는 만료된 궤적을 "플래너가
+    # 사라짐"으로 판단하고 정지하므로 이 값은 해당 상태의 감지 시간이기도 합니다.
+    valid_for_sec: 2.0
+
+vehicle_state_node:
+  ros__parameters:
+    # gnss_imu_pose_node의 Odometry입니다. RTK 지면 속도는 twist.linear.x,
+    # yaw 각속도는 twist.angular.z에 들어 있습니다.
+    #
+    # `/state_estimation/pose`가 아닙니다. 그 이름은 얼핏 올바른 선택처럼 보이지만
+    # 아무 노드도 발행하지 않으며, 의도적으로 활성 상태 추정기로 사용하지 않는
+    # MOLA smoother의 토픽 이름입니다. 같은 이유로 localization.launch.py도
+    # `state_pose_topic`을 이 토픽으로 설정합니다.
+    # 부드러운 로컬 ESKF 상태를 우선 사용합니다. TF로 odom -> map 변환하며,
+    # 우선 입력이 오래되면 전역 ESKF map 자세를 대체 입력으로 사용할 수 있습니다.
+    primary_odom_topic: "/ekf/odometry"
+    fallback_odom_topic: "/localization/reference_pose"
+    output_frame: "map"
+    primary_timeout_sec: 0.5
+    primary_recovery_messages: 3
+    # 최신 map<-odom 변환이 odometry보다 얼마나 오래되어도 되는지 정합니다.
+    # 조회는 대기하지 않습니다(vehicle_state_node._latest_transform 참고).
+    # 갱신이 멈춘 변환은 거부되며 자세도 발행하지 않습니다.
+    transform_timeout_sec: 0.5
+    vehicle_state_topic: "/localization/vehicle_state"
+    min_speed_for_curvature_kmph: 1.8
+    report_period_sec: 10.0
+
+stanley_node:
+  ros__parameters:
+    trajectory_topic: "/planning/trajectory"
+    vehicle_state_topic: "/localization/vehicle_state"
+
+    # ---- 액추에이터 출력 ------------------------------------------------
+    # pure_pursuit_node와 같은 토픽입니다. path_tracking.launch.py는
+    # controller_type으로 지정한 컨트롤러만 시작합니다.
+    angle_topic: "/target_angle"
+    speed_topic: "/target_speed"
+    brake_topic: "/brake"
+
+    # 게인이 아니라 부호입니다. +1.0 또는 -1.0만 허용되며 그 외 값은 노드가
+    # 거부합니다. 2026-09-12 측정값은 +1.0입니다(README). Stanley에는 아래에
+    # 명시적인 게인이 있으므로 이 값으로 조향 세기를 튜닝하지 마십시오.
+    steering_sign: 1.0
+
+    # ---- STANLEY 제어식 -------------------------------------------------
+    #   delta = heading_gain * (route yaw - vehicle yaw)
+    #         + atan(cross_track_gain * e / (softening + v))
+    # e는 앞차축(뒷차축보다 wheelbase_m만큼 앞)의 횡오차이며 차량이 경로의
+    # 왼쪽에 있을 때 양수입니다.
+    #
+    # cross_track_gain [1/s]: 1 m 이탈당 경로로 복귀시키는 조향 세기입니다.
+    #   높게 -> 빠르게 수렴하지만 흔들릴 수 있음, 낮게 -> 부드럽지만 넓게 이탈
+    # 5 km/h(1.39 m/s), 완화값 3.6 km/h에서 1.0은 0.5 m 오차를
+    # atan(1.0 * 0.5 / 2.39) = 조향 11.8도로 변환합니다.
+    # 2026-09-20: 첫 주행에서 차량이 크게 좌우 진동하여 k 1.0 -> 0.5,
+    # 완화값 3.6 -> 7.2 km/h로 변경했습니다. 횡오차 항은
+    # atan(k * cte / (v + softening))입니다. 기존 값은 5~10 km/h에서 0.5 m
+    # 오차에 실제 바퀴각 8~12도, 즉 전체 가동범위 12.4도를 요구했습니다.
+    # 따라서 작은 오차마다 한쪽 최대 조향 후 반대쪽 최대 조향이 발생했습니다.
+    # 현재는 0.5 m에 4~5도를 요구합니다. 백에서 차량 수렴이 너무 느린 것이
+    # 확인될 때만 k를 다시 올리십시오.
+    # 2026-09-20(진동 개선 2단계): 아래의 yaw 각속도 감쇠 및 조향 선행 제한과
+    # 함께 0.5 -> 0.3, 완화값 7.2 -> 10.8 km/h로 변경했습니다. 이제 5 km/h에서
+    # 0.5 m 오차는 실제 바퀴각 약 2.0도를 요구합니다(첫 주행의 1.0 / 3.6에서는
+    # 11.8도). 튜닝 순서는 이 구간 끝을 참고하십시오.
+    cross_track_gain: 0.3
+
+    # 분모의 속도에 더해지므로 정지 상태에서도 제어식이 정의되고 저속 차량에
+    # 작은 오차만으로 큰 조향을 명령하지 않습니다. 이 파일의 다른 속도처럼
+    # 파라미터 경계에서는 km/h 단위입니다.
+    cross_track_softening_kmph: 10.8
+
+    # 1.0이 기본 Stanley 제어식입니다. 차량 헤딩은 저속에서 노이즈가 큰 RTK
+    # 속도 course에서 오며, 이 게인에서는 노이즈가 줄지 않고 조향에 전달됩니다.
+    # 보행 속도의 직선 주행에서 바퀴가 떨리면 낮추십시오(예: 0.7).
+    heading_gain: 0.6
+    # 2026-09-24: 코너에서 필요한 조향 중 heading 항이 못 채우는 (1 - heading_gain)을
+    # 경로 곡률로 더합니다: (1 - heading_gain) * atan(축거 * 곡률). 없으면 차가
+    # 그만큼을 cte로 벌기 위해 코너 바깥으로 밀립니다(stanley_0924_191013: 반경
+    # 4 m 코너에서 1.9~2.5 m, 모델 예측과 0.1~0.2 m 차이). 상태에 ff=로 표시.
+    curvature_feedforward: true
+
+    # ---- 신호등 정지 (2026-10-02) ----------------------------------------
+    # krowd_mission_manager와 같은 규칙입니다 (signal_stop.py):
+    #   신호 구간 안: 속도 7 km/h 제한. 구간 전에는 0.5 m/s^2로 미리 줄입니다.
+    #   구간 방향(직진/좌회전)의 빨간불이 2프레임 연속 -> 정지(brake), 조향 유지.
+    #   같은 방향의 확정 GO(go_*_confirmed)가 와야 다시 출발합니다.
+    #   신호를 모르거나 검출 노드가 없으면 통과합니다. 구간 밖의 빨간불은 무시합니다.
+    # 구간은 맵 폴더의 traffic_detect_zones.yaml / left_turn_zones.yaml
+    # (waypoint 번호)이고, 구간이 없는 맵에서는 아무 일도 하지 않습니다.
+    # 상태: STOP SIGNAL_RED ..., TRACKING ... signal=#64-68/straight
+    signal_stop_enabled: true
+    signal_zone_speed_kmph: 7.0
+    signal_red_confirm_frames: 2
+    signal_go_ttl_sec: 0.25         # 확정 GO 프레임이 이보다 오래되면 출발하지 않음
+    signal_timeout_sec: 0.5         # 빨간불 프레임이 이보다 오래되면 정지를 시작하지 않음
+    # 2026-10-17: 빨간불에 서 있는데 신호등을 놓치면(unknown/off, 정지 후 카메라 시야
+    # 밖) 이 시간 동안 빨간불 프레임이 없을 때 확정 GO 없이 출발합니다 (1017_095741에서
+    # 세 번째 신호에서 영원히 정지). 0이면 예전처럼 확정 GO만 기다립니다.
+    # 상태: STOP SIGNAL_RED ... light=unknown red_frames=0 lost=12/30s
+    signal_lost_release_sec: 30.0
+    # 맵의 신호 구간 중 Stanley가 무시할 구간 (라벨 = traffic_detect_zones의 "시작-끝").
+    # 무시한 구간은 신호 감속·정지 없이 일반 도로처럼 통과합니다. 맵 파일은 그대로라
+    # 다른 노드(/traffic_detect_space 등)에는 영향 없음. 다시 켜려면 [""]로.
+    # 2026-10-17 사용자 요청: 본선(20260913_103732_repaired) 1·2번째 신호 임시 비활성화.
+    signal_skip_zones: ["64-68", "108-116"]
+    # 2026-10-17: 빨간불에 서 있을 때 검출기가 green(go_straight/go_left, 미확정)을
+    # 이 창 안에 이 프레임 수만큼 읽으면 확정 GO를 기다리지 않고 출발합니다. 연속일
+    # 필요 없고, 사이에 red 프레임이 오면 세던 것을 지웁니다 (1017_110957: red/unknown
+    # 1 Hz 깜빡임 끝에 green 2+2 프레임이 왔지만 확정은 안 됨 → 출발 못 함).
+    # 0이면 끕니다(확정 GO만).
+    signal_go_seen_frames: 2
+    signal_go_seen_window_sec: 1.5
+    # 2026-10-17: 정지선 검출이 없을 때 빨간불 정지 위치. true = 신호 구간의 마지막
+    # 웨이포인트(traffic_detect_zones 끝 번호)를 정지선으로 보고 7 km/h로 거기까지
+    # 진행해 제동 모델로 정지(우회전 일시정지와 같음). false = 빨간불을 확인한 자리에서
+    # 바로 정지(예전 mission_manager 규칙). GLane3D 정지선이 보이면 둘 중 가까운 쪽.
+    # 구간 끝 번호가 정지선 자리인지 맵마다 확인할 것: 본선 68/116/242/296/386 확인됨,
+    # 예선 139/196은 미확정(다른 패키지는 194에서 정지).
+    signal_stop_at_zone_end: true
+    signal_approach_decel_mps2: 0.5
+    signal_zones_topic: "/planning/signal_zones"            # route_publisher_node가 발행
+    traffic_json_topic: "/traffic_light/detections_json"    # 신호등 검출 노드
+
+    # ---- 정지선 (2026-10-02) ---------------------------------------------
+    # 차선인식(han_Glane3D)이 내는 /glane3d/stopline_markers(base_link 기준
+    # LINE_STRIP)를 krowd_final_control과 같은 추정기(stopline.py, 복사본)로 읽습니다.
+    # 빨간불일 때: 정지선이 보이면 구간 속도로 더 가서 앞범퍼가 정지선
+    # stopline_stop_buffer_m 앞에 서도록 제동합니다. 구간 끝은 넘지 않습니다.
+    # 정지선이 안 보이거나 stopline_ttl_sec보다 오래됐으면 빨간불을 본 자리에서
+    # 바로 제동합니다(정지선 없을 때와 같음). false면 정지선을 쓰지 않습니다.
+    # 상태: TRACKING ... signal=#64-68/straight stopline=7.3m
+    #       TRACKING ... signal_red=#64-68 to_stop=2.1m  (빨간불, 정지선까지 접근 중)
+    stopline_enabled: true
+    stopline_topic: "/glane3d/stopline_markers"
+    stopline_ttl_sec: 2.0               # 마지막 검출 뒤 이 시간까지 주행 거리로 이어 씀 (미실측 설계값)
+    stopline_stop_buffer_m: 1.0         # 앞범퍼가 정지선 이만큼 앞에 정지
+    front_axle_to_front_bumper_m: 1.194 # 실측 (krowd_final_control vehicle 설정과 같은 값)
+    stopline_lateral_half_band_m: 0.63  # 차폭 절반: 이 범위와 겹치는 선만 사용
+    stopline_min_span_m: 1.0
+    stopline_max_abs_slope: 0.5
+    stopline_max_distance_m: 30.0
+    # 제동 거리 가정: v * 지연 + v^2 / (2 a). krowd_final_control braking 값과 같음
+    # (15 km/h 실측 2.20 m -> 3.95 m/s^2, 지연 1.0 s).
+    signal_brake_latency_sec: 1.0
+    signal_brake_decel_mps2: 3.95
+
+    # ---- 장애물 회피 인계 (2026-10-07) ------------------------------------
+    # 맵 폴더 avoidance_zones.yaml(waypoint 번호, RViz 하늘색)의 구간에서:
+    #   구간 전: 0.5 m/s^2로 5 km/h까지 감속해 유지 -> 현재 속도의 제동거리
+    #           (위 signal_brake_latency_sec/decel 모델)가 구간 시작점에 닿는 순간 brake
+    #           -> 앞차축이 구간 시작 웨이포인트 '에서' 정지 (구간 안이 아님, 2026-10-09).
+    #           구간 안에서 시작/재개하면 그 자리에서 즉시 정지.
+    #   정지 확인(0.3 m/s 이하 1 s, 경로 방향 5° 이내; 10 s 넘으면 그냥) ->
+    #   /stanley_node/handoff 발행, 액추에이터 토픽 발행 중단(침묵).
+    #   avoidance_supervisor_node가 cone_avoidance_1005 런치를 띄우고,
+    #   DONE / 구간 끝 통과 / 제한시간 중 먼저 오는 쪽에서 끄고 /stanley_node/resume.
+    #   재개 뒤 같은 구간은 다음 바퀴에 다시 들어올 때까지 넘기지 않습니다.
+    # 구간이 없는 맵에서는 아무 일도 하지 않습니다. false면 끕니다.
+    # 상태: TRACKING ... avoid_approach=#107-135 / STOP AVOIDANCE_HANDOFF ... /
+    #       HANDOFF AVOIDANCE zone=#107-135 past_end=0 t=12.3s
+    avoidance_handoff_enabled: true
+    avoidance_zones_topic: "/planning/avoidance_zones"
+    handoff_topic: "/stanley_node/handoff"
+    resume_topic: "/stanley_node/resume"
+    avoidance_approach_speed_kmph: 5.0
+    avoidance_approach_decel_mps2: 1.0
+    avoidance_stop_speed_mps: 0.3
+    avoidance_stop_settle_sec: 1.0
+    avoidance_heading_tolerance_deg: 5.0
+    avoidance_align_timeout_sec: 10.0
+
+    # ---- 우회전 일시정지 (2026-10-17) ------------------------------------
+    # 맵 폴더 pause_zones.yaml(stanley_node: pause_zones, waypoint 번호 범위,
+    # 마지막 번호 = 정지선 위치)의 구간에서 (pause_stop.py):
+    #   구간 전: 0.5 m/s^2로 7 km/h까지 감속. 구간 안: 7 km/h로 정지점까지 진행.
+    #   정지점 = 차선인식 정지선(stopline_stop_buffer_m 앞) 또는 구간 끝 웨이포인트 중
+    #   가까운 쪽. 제동거리(signal_brake_latency_sec/decel 모델)만큼 앞에서 brake.
+    #   0.3 m/s 이하로 pause_hold_sec 동안 서 있으면 출발(시작 램프). 같은 구간은
+    #   다음 바퀴에 다시 들어올 때까지 다시 서지 않습니다.
+    # 신호 구간과 겹치면 빨간불 정지가 우선이고, 그동안은 정지 시간이 세어지지 않습니다.
+    # 상태: TRACKING ... pause_approach=#110-114 / pause=#110-114 to_stop=3.2m /
+    #       STOP PAUSE zone=#110-114 (at the zone end) held 1.2/3.0s
+    pause_stop_enabled: true
+    pause_zones_topic: "/planning/pause_zones"
+    pause_zone_speed_kmph: 7.0
+    pause_approach_decel_mps2: 0.5
+    pause_hold_sec: 3.0
+    pause_stop_speed_mps: 0.3
+
+    # 경로 방향은 앞차축 투영점을 중심으로 이 길이의 경로 호를 가로지르는 현의
+    # 방향입니다. 기록된 웨이포인트 yaw가 아니라 경로 형상을 사용합니다.
+    # 웨이포인트 간격은 약 1 m이므로 2.0 m는 약 2개를 포함합니다.
+    heading_window_m: 4.0
+
+    # 최초 전역 투영 이후에는 마지막 경로 위치 근처만 탐색합니다. 끝점이 시작점
+    # 근처로 돌아오거나 자기 교차하는 경로에서 한 제어 주기 안에 수백 개
+    # 웨이포인트를 건너뛰는 현상을 방지합니다. 20 Hz에서 차량은 한 주기당
+    # 웨이포인트 하나보다 훨씬 적게 전진하며, 전방 허용 범위를 넓게 두어
+    # 로컬라이제이션 누락도 수용합니다.
+    projection_backward_segments: 5
+    projection_forward_segments: 30
+
+    # ---- 출발 / 안전 ----------------------------------------------------
+    # 차량 방향이 기록 경로 방향과 60도보다 크게 다르면 주행을 거부합니다.
+    # 반전되거나 오래된 헤딩이 최대 조향 명령으로 변하기 전에 검출합니다.
+    max_heading_error_deg: 60.0
+    # ESKF는 검증되지 않은 저장 시작 prior로 odometry 자세를 발행할 수 있습니다.
+    # RTK course 또는 검증된 맵 로컬라이제이션이 yaw를 확인하기 전에는 절대
+    # 정상 추종에 진입하지 않습니다. 전용 transient-local 플래그는 컨트롤러를
+    # 재시작해도 유지됩니다.
+    # ESKF가 헤딩 검증을 알릴 때까지 주행하지 않습니다
+    # (/ekf/heading_verified, std_msgs/Bool, 래치됨). 그전에는 이전 세션에서
+    # 저장한 헤딩을 사용하며, 2026-09-21에는 이 값이 124도 틀렸습니다.
+    # 현재 실사용 설정은 RTK Fixed 직선 course만 허용합니다. LiDAR
+    # 로컬라이제이션은 ESKF yaw를 설정할 수 없습니다. 해당 course를 얻을 때까지
+    # STOP HEADING_UNVERIFIED를 유지합니다. 시뮬레이션에서는
+    # sim_overrides.yaml이 이 기능을 끕니다.
+    heading_verified_topic: "/ekf/heading_verified"
+    heading_verified_required: true
+    # 래치된 ESKF True만으로는 부족하며 source=rtk_course를 요구합니다. 현재
+    # 검증된 LiDAR 맵 자세가 있으면 독립적으로 비교하고 불일치 시 정지합니다.
+    # LiDAR는 ESKF yaw를 절대 변경하지 않습니다.
+    heading_source_topic: "/ekf/heading_source"
+    heading_status_timeout_sec: 2.0
+    # 2026-09-26: true -> false. 이 검사는 waypoint heading이 아니라 ESKF와
+    # MOLA 맵 heading을 비교합니다. 9/26 출발 정지는 모두 MOLA가 틀린 경우였습니다
+    # (20:41 MOLA -90°, ESKF는 경로 방향과 -3°). ESKF가 크게 틀리면(9/26 19:50,
+    # 122°) 경로 방향 대비 60° 검사(HEADING_NOT_ALIGNED)가 잡습니다. 20~60° 오류는
+    # 잡지 못하므로 GPS course 비교 검사로 대체 예정. 다시 켜려면 true.
+    map_heading_consistency_required: false
+    map_heading_odometry_topic: "/mola/map_localization/odometry"
+    map_heading_verified_topic: "/mola/map_localization/heading_verified"
+    # 2026-09-24: 15 -> 20. 정지 상태 차이가 약 7° 고정이고 코너에서 MOLA
+    # 지연으로 15~26°까지 벌어졌습니다(stanley_0924_191013).
+    map_heading_max_disagreement_deg: 20.0
+    # 2026-09-24: 한 번 넘었다고 바로 멈추지 않고 이 시간 동안 계속 넘을 때만
+    # 정지합니다. 코너에서 MOLA 지연으로 0.1~0.5 s 넘는 일이 14번 있었고, 그때마다
+    # 3~6 s 섰습니다. 이 각도 이상이면 기다리지 않고 바로 정지합니다. 0.0 = 예전 동작.
+    map_heading_disagreement_hold_sec: 1.5
+    map_heading_immediate_stop_deg: 45.0
+    # MOLA 자세는 약 2~3 Hz로 측정되며 간혹 1.7초 공백이 있었고, verified
+    # 플래그 간격은 때때로 2초를 넘었습니다. 0.5초 게이트는 정상 데이터에서도
+    # /target_speed를 TRACKING과 STOP 사이에서 반복 전환시켰습니다.
+    # ESKF도 동일한 3초 구간 이후 LiDAR 헤딩을 독립적으로 무효화합니다.
+    map_heading_timeout_sec: 3.0
+
+    # ---- 타이밍 및 제한 -------------------------------------------------
+    control_rate_hz: 20.0
+    vehicle_state_timeout_sec: 0.5
+    goal_tolerance_m: 1.0
+    # 종점에서 정지한 뒤(STOP_AT_END) 차량이 경로 시작부로 돌아오면 추종을
+    # 재개합니다. 조건은 경로를 따라 시작점에서 이 거리 안,
+    # corridor_half_width_m 안쪽, 경로 끝점에서 2 * goal_tolerance_m보다 먼
+    # 곳입니다(양 끝이 가까운 루프가 정지한 자리에서 재시작하지 않도록 함).
+    # 재시작한 주행이나 백에서 gnss_imu_pose_node 자세가 다시 나타나기 전에
+    # 이동하는 약 5 m보다 커야 합니다. 5 m로 설정했을 때 첫 자세는 이미 경로상
+    # 5.4 m(Pure Pursuit) / 7 m(Stanley) 지점에 도착해 있었습니다.
+    # 0이면 경로 추종을 재시작할 때까지 정지 상태를 유지합니다.
+    restart_near_start_m: 10.0
+    corridor_half_width_m: 3.0
+    # 저장 경로는 현재 균일한 +/-3 m 주행 영역으로 변환됩니다. 앞차축 투영점이
+    # 영역 밖으로 나가면 브레이크를 작동해 정지합니다.
+    stop_outside_corridor: true
+    # 주행 영역 밖에서는 제동만 하지 않고 경로로 저속 복귀합니다(recovery.py).
+    # recovery_speed_kmph로 이동하며, 투영점보다 recovery_lookahead_m 앞의 경로
+    # 지점을 향해 Pure Pursuit의 원호 제어식으로 조향합니다. done_offset_m과
+    # done_heading_deg를 모두 만족해야 추종을 재개하므로 경로를 가로지르는
+    # 도중에는 제어를 넘기지 않습니다. max_offset_m 초과, max_sec 경과, 목표가
+    # 차량 뒤에 있음, 또는 한 주기에 오차가 max_jump_m보다 크게 점프한 경우
+    # (차량이 아니라 자세가 이동한 경우) 포기합니다(STOP RECOVERY_FAILED).
+    # 경로 밖에는 차선 정보가 없으므로 비상정지 담당자가 있을 때만 사용합니다.
+    # false이면 기존처럼 STOP OUTSIDE_CORRIDOR로 동작합니다.
+    recovery_enabled: true
+    recovery_speed_kmph: 4.0
+    recovery_lookahead_m: 6.0
+    recovery_done_offset_m: 1.5
+    recovery_done_heading_deg: 30.0
+    recovery_max_offset_m: 8.0
+    recovery_max_sec: 20.0
+    recovery_max_jump_m: 1.0
+    # 2026-10-17: 복구 완료(DONE)는 corridor 안일 때만. 경로 시작점 앞에서 출발하면
+    # 투영이 wp 0에 고정되어 cte/heading은 멀쩡해도 corridor 밖이라, 이 조건이
+    # 없을 때 RECOVERING/TRACKING이 매 주기 번갈아 나와 속도 명령이 4↔21 km/h로
+    # 요동쳤습니다(1017_095741). 시작점 앞에서는 복구 속도로 wp 0까지 가고 그동안
+    # 복구 제한시간은 세지 않습니다(상태에 before_route_start).
+
+    # ---- 수동 운전 감지 (2026-10-17) -------------------------------------
+    # 우리가 brake를 내는데 차가 이 속도보다 빠르게 이 시간 이상 움직이면 다른
+    # 사람이 운전 중인 것으로 보고 장애물 회피 인계를 하지 않습니다 (수동 주행 중
+    # 회피 구간을 지나가자 cone_avoidance가 떠 버린 1017_095741 재발 방지).
+    external_motion_speed_mps: 1.5   # 5.4 km/h: 7 km/h에서 제동 중(지연 1 s)에는 걸리지 않음
+    external_motion_sec: 3.0
+    stall_warning_period_sec: 5.0
+
+    # ---- 출발 램프 ------------------------------------------------------
+    # 경로 속도 프로파일에는 정지 상태 출발 램프가 없습니다. 따라서 추종 시작
+    # 또는 재개 후 첫 몇 m 동안 명령 상한을 sqrt(v0^2 + 2 a d)로 제한합니다.
+    # v0 = start_speed_kmph(현재 속도가 더 높으면 현재 속도),
+    # a = start_accel_mps2, d = 이후 주행 거리(m)입니다. 5 km/h와 1.0 m/s^2에서
+    # 상한은 2.9 m 후 10 km/h, 7.7 m 후 15 km/h에 도달합니다. 제한이 적용되는
+    # 동안 상태에 "ramp"가 표시됩니다. 0이면 비활성화합니다.
+    # ---- 조향 모터 지연(2026-09-20 진동 개선) ---------------------------
+    # 경로가 요구하지 않은 yaw 각속도에 반대 방향으로 보정합니다.
+    #   보정값 = gain_s * (속도 * 경로 곡률 - 측정 yaw 각속도)
+    # /ekf/odometry의 twist.angular.z를 사용합니다(rad/s, 왼쪽이 양수).
+    # 0.15초 설정에서 직선 주행 중 왼쪽으로 10 deg/s 회전하는 차량에는 오른쪽
+    # 1.5도를 적용합니다. 0이면 비활성화합니다. angular.z가 0에 고정되거나
+    # 부호가 틀린 경우 0을 사용하십시오.
+    yaw_rate_damping_gain_s: 0.15
+    # 2026-09-27: 15 km/h 위에서는 감쇠 게인을 속도에 반비례로 줄입니다. 고정
+    # 0.15이면 30 km/h에서 조향 지연과 겹쳐 2~4 Hz 떨림이 났습니다(시뮬레이션:
+    # 바퀴 ±0.5°, 차체 0.28° -> 적용 후 0.25°, 0.08°). 0이면 항상 0.15.
+    yaw_rate_damping_full_speed_kmph: 15.0
+    # 실제 조향각은 ros_can_bridge의 /encoder(angle_rad, 명령축)를
+    # vehicle.yaml의 조향표로 실제 바퀴각으로 변환한 값입니다. 조향 목표가 실제
+    # 각도보다 앞설 수 있는 최대값을 양방향으로 제한합니다. 0이면 비활성화합니다.
+    steering_feedback_topic: "/encoder"
+    # 2026-09-21: 3.0 -> 8.0. 제한을 처음 적용한 주행에서 바퀴는 약 2.5 deg/s
+    # (0.2초 동안 steer_fb +0.8 -> +1.3도)로만 움직였습니다. 측정값 + 3도에
+    # 목표가 묶여 헤딩 오차 60도에서 컨트롤러가 최대 13.7도를 요구했는데도
+    # 명령은 +1.8 / +3.8도였고 차량은 직선에서 주행 영역을 벗어났습니다.
+    # 8도도 명령이 실제 바퀴보다 최대 가동범위 전체만큼 앞서 누적되는 것은
+    # 막아줍니다.
+    max_steering_command_lead_deg: 5.0
+    # 곡선에서는 아래 두 반경 사이의 경로 곡률에 따라 이 값까지 혼합 적용합니다
+    # (stanley.steering_lead_limit). 직선 값은 실제 바퀴가 아직 움직이지 않은
+    # 조향량이 명령에 누적되는 것을 막습니다. 코너에서는 즉시 가동범위가
+    # 필요합니다. 2026-09-22에는 단일 3도 제한으로 조향이 움직이는 동안 폭
+    # 4.4 m 굽은 구간 바깥으로 밀렸습니다. R >= 50 m에서는 직선 값,
+    # R <= 15 m에서는 곡선 값을 사용하며 그 사이는 곡률에 따라 선형
+    # 보간하므로 코너 진입 전에 제한이 열립니다. 단일 제한을 쓰려면 곡선 값을
+    # 직선 값과 같게 설정하십시오.
+    max_steering_command_lead_curve_deg: 12.0
+    steering_lead_straight_radius_m: 50.0
+    steering_lead_curve_radius_m: 15.0
+    # true이면 /encoder가 한 번도 없거나 steering_feedback_timeout_sec 동안
+    # 들어오지 않을 때 제동합니다(STOP NO_STEERING_FEEDBACK /
+    # STALE_STEERING_FEEDBACK). CAN bridge가 실행 중이어야 합니다.
+    # 시뮬레이터에서는 sim_overrides.yaml이 이 기능을 끕니다.
+    steering_feedback_required: true
+    steering_feedback_timeout_sec: 0.25
+    #
+    # 튜닝 순서: 한 번에 하나만 변경하며 완료할 때까지 속도는 5 km/h 유지
+    #   1. 직선에서 계속 흔들림              heading_gain 0.6 -> 0.5
+    #   2. 횡오차 부호가 계속 바뀜            cross_track_gain 0.3 -> 0.25
+    #   3. 흔들림은 없지만 복귀가 느림         cross_track_gain 0.3 -> 0.4
+    #   4. 조향 명령이 실제 바퀴보다 앞섬      max_steering_command_lead_deg 5 -> 3 (직선)
+    #   4b. 코너에서 바깥으로 밀린다         max_steering_command_lead_curve_deg 12 -> 16 (커브)
+    #   5. 코너 반응이 늦음                   heading_window_m 4.0 -> 3.0
+    #   6. 흔들림 없이 조향만 너무 느림        vehicle.yaml max_steering_rate_deg_s 20 -> 30
+
+    # ---- 속도 보정(2026-09-20) -----------------------------------------
+    # 첫 Stanley 주행에서 구동 MCU가 목표 5 km/h에 도달하지 못했습니다
+    # (직선 평균 3.8 km/h). 차량이 목표보다 느린 동안 적분 보정값으로
+    # /target_speed를 올립니다(speed_trim.py).
+    #   보정값은 초당 게인 * 부족분만큼 증가하며 [0, 최댓값] 안에서 유지됩니다.
+    # 0.3 /s에서는 1.2 km/h 부족 시 초당 0.36 km/h를 더합니다. MCU 자체 PI
+    # 루프가 이 루프 안에서 안정되어야 하므로 의도적으로 느리게 설정했습니다.
+    # 최댓값 5 km/h에서는 명령이 목표보다 5 km/h 이상 높아지지 않습니다.
+    # 1 km/h 아래에서는 적분하지 않으므로 ASMS 대기 중 누적되지 않습니다.
+    # 0이면 비활성화합니다. 상태에는 결과가 cmd_v=로 표시됩니다. 백의
+    # /target_speed와 /ekf/odometry 속도를 비교해 튜닝하십시오. 현재 값은
+    # 초기 추정값입니다.
+    speed_trim_gain_per_s: 0.3
+    speed_trim_max_kmph: 5.0
+    speed_trim_min_speed_kmph: 1.0
+    # 2026-09-24: 경로 반경이 이보다 작은 곳에서는 trim을 더하지 않습니다(값은
+    # 유지했다가 코너를 벗어나면 다시 적용). 코너에서 목표보다 최대 5 km/h를 더
+    # 요청하던 것을 막습니다. 상태에 trim_hold로 표시. 0이면 항상 적용.
+    speed_trim_min_radius_m: 15.0
+    start_speed_kmph: 15.0    # km/h(route_publisher/controllers에서 3.6으로 한 번 나눔. 미리 나누지 말 것)
+    start_accel_mps2: 3.0   # m/s2 물리 단위. km/h 토픽 때문에 재환산하지 말 것
+
+    # ---- 헤딩 획득 저속 전진 -------------------------------------------
+    # 초기 헤딩은 센서 스택 ESKF(이미 검증된 경우), 검증된 LiDAR 맵 정합,
+    # 마지막으로 약 5 m 직진 주행의 RTK course 순으로 얻습니다.
+    # gnss_imu_pose_node는 /gnss_imu/heading_acquisition으로 출처를 보고합니다.
+    # ESKF와 LiDAR 모두 없는 NEEDS_MOTION 상태에서만 이 노드가 아래 속도로
+    # 최대 지정 시간 동안 직진(조향 0)합니다. 그전에는 명령 없이 WAIT합니다.
+    # 첫 번째 상태가 되면 출발 램프를 거쳐 추종으로 넘기고, 시간초과 시 제동합니다
+    # (STOP HEADING_NOT_ACQUIRED, 재시도하려면 경로 추종 재시작). 5 km/h로 12초는
+    # 약 17 m입니다. 이 구간은 앞을 인식하지 않고 주행하므로 전방이 비어 있어야
+    # 합니다. 0이면 비활성화(WAITING)합니다.
+    # heading_creep_requires_request가 false이면 NEEDS_MOTION을 기다리지 않고
+    # 저속 전진합니다(2026-09-18 이전 동작).
+    heading_creep_speed_kmph: 7.0    # km/h(route_publisher/controllers에서 3.6으로 한 번 나눔. 미리 나누지 말 것)
+    heading_creep_max_sec: 15.0
+    heading_creep_requires_request: true
+    # 2026-09-23: ESKF는 이제 RTK course만으로 헤딩을 검증합니다
+    # (gps_imu_eskf.yaml use_map_heading: false). 정지 상태에서는 검증되지
+    # 않으므로 대기 시간을 5초(LiDAR 정합 기회)에서 1초로, 저속 전진 속도를
+    # 6에서 7 km/h로 변경했습니다. course에는 >= 1 m/s가 필요하고 구동 MCU의
+    # 실제 속도가 목표보다 약 1.7 km/h 낮아 6을 명령하면 약 4.3 km/h만 나왔습니다.
+    # /ekf/heading_verified가 false인 동안 브레이크를 작동한 채
+    # heading_creep_wait_sec만큼 LiDAR 정합을 기다린 뒤,
+    # heading_creep_speed_kmph로 직진하며 검증을 기다립니다. 최대
+    # heading_creep_max_sec / _max_m 이후에는 STOP HEADING_NOT_ACQUIRED입니다.
+    # 차량을 손으로 경로 방향과 대략 맞춰 놓고 전방 15 m를 비워야 하며,
+    # 비상정지 담당자가 있을 때만 사용합니다.
+    heading_creep_on_unverified: true
+    heading_creep_wait_sec: 1.0
+    heading_creep_max_m: 15.0
+
+    # ---- 진단 -----------------------------------------------------------
+    # /stanley_node/ 아래에 생성됩니다. cross_track_error는 앞차축에서의 m 단위
+    # 횡오차(양수 = 차량이 경로 왼쪽), heading_error는 rad 단위입니다
+    # (경로 yaw - 차량 yaw, 양수 = 경로가 차량 진행 방향의 왼쪽을 향함).
+    # target_marker(자홍색)는 경로 위에 투영한 앞차축의 수선의 발입니다.
+    status_topic: "~/status"
+    cross_track_error_topic: "~/cross_track_error"
+    heading_error_topic: "~/heading_error"
+    target_marker_topic: "~/target_marker"
+
+# cone_avoidance_1005를 띄우고 끄는 감독 노드 (avoidance_supervisor_node.py).
+# 런치 명령 자체(launch_command)는 launch 파일 인자 cone_launch_command로 줍니다
+# (실차 기본: ros2 launch cone_avoidance_1005 cone_avoidance_1005.launch.py
+#  use_can:=false use_rviz:=false / 시뮬레이션: fake_cone_mission.py).
+avoidance_supervisor_node:
+  ros__parameters:
+    handoff_topic: "/stanley_node/handoff"
+    resume_topic: "/stanley_node/resume"
+    mission_status_topic: "/cone_avoidance_1005/mission_status"
+    command_topic: "/target_speed"          # cone 쪽 첫 명령 확인용 (시뮬레이션은 /simulation/target_speed)
+    done_state: "DONE"
+    # 2026-10-07 실차: 10 s였을 때 cone guard가 0.3 s 만에 떠서 명령을 내고 있었는데도
+    # 감독 노드가 9.5 s 동안 한 건도 못 받아(차량 PC의 DDS 발견 지연, 같은 날 Stanley도
+    # 경로 구간을 31 s 뒤에 받음) 끄고 말았음. 발견 지연보다 넉넉히.
+    first_command_timeout_sec: 45.0         # 이 안에 cone 명령(또는 guard 상태)이 없으면 끄고 복귀
+    guard_status_topic: "/cone_avoidance_1005/command_guard_status"
+    # cone 단독 런치는 guard의 제어기 brake 입력을 아무도 안 풀어서(통합 모드 전용 토픽)
+    # 차가 출발하지 못합니다. cone이 도는 동안 이 토픽에 false를, 끌 때 true를 냅니다.
+    controller_brake_topic: "/cone_avoidance_1005/controller/brake"
+    max_duration_sec: 120.0                 # 전체 제한시간
+    shutdown_grace_sec: 5.0                 # SIGINT 뒤 이만큼 기다리고 SIGKILL

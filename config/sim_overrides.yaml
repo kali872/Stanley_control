@@ -1,0 +1,19 @@
+# Overrides for stanley_dynamics_sim.launch.py, keyed by NODE NAME on purpose:
+# path_tracking.yaml sets these under the node's own name, and a node-name key
+# beats both a launch dict (written as /**) and a -p argument. Listed after
+# path_tracking.yaml in the launch, so these win.
+#
+# Default = AS ON THE VEHICLE (2026-09-23): the simulator publishes a steering
+# encoder (/simulation/encoder) and plays the ESKF's RTK-course heading
+# verification, so stanley_node runs with the feedback watchdog, the lead limit,
+# the heading gate and the unverified creep exactly as path_tracking.yaml sets
+# them. Only what the simulation cannot provide is overridden here.
+# ideal:=true uses sim_ideal.yaml instead.
+route_publisher_node:
+  ros__parameters:
+    goal_mode: "STOP_AT_END"    # ramp to a stop at the last waypoint, as on the vehicle
+stanley_node:
+  ros__parameters:
+    steering_feedback_topic: "/simulation/encoder"
+    # No LiDAR map-heading monitor runs in the simulation.
+    map_heading_consistency_required: false

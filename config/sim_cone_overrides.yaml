@@ -1,0 +1,12 @@
+# cone_avoidance_1005 overrides for stanley_dynamics_sim.launch.py (passed as
+# its `overrides:=` file when the real cone stack runs in the simulation).
+# The simulator has no GPS and its LiDAR is scripts/fake_lidar_drums.py.
+/**:
+  ros__parameters:
+    rtk:
+      enabled: false                  # no NavSatFix in the simulation
+    topics:
+      pointcloud: /simulation/points  # fake_lidar_drums.py (base_link frame)
+      # the controller's output must go through the guard (see cone_standalone_overrides.yaml)
+      steer_cmd: /cone_avoidance_1005/controller/target_angle
+      target_speed: /cone_avoidance_1005/controller/target_speed

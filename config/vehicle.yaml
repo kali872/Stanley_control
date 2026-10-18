@@ -1,0 +1,101 @@
+# KROWD vehicle geometry - what the car IS, not how it is tuned.
+#
+# Single source of truth. These were previously readable only inside
+# krowd_embedded_mpc/mpc_algorithm_embedded.py (KROWD technical report, vehicle
+# specification table, pages 2-3), which meant every other consumer carried its
+# own copy of the numbers.
+#
+# Applied to every node in the launch (`/**`) so that anything needing the
+# wheelbase - including mola_slam_mapping's wheel_odom_bicycle_node, which
+# declares the same `wheelbase_m` parameter - reads one value.
+/**:
+  ros__parameters:
+    wheelbase_m: 1.340
+    track_width_m: 1.080
+
+    # Measured 2026-09-19: turning circle DIAMETER 5.15 m with the wheels turned
+    # to the mechanical lock by hand. Taken as the vehicle-centre circle, so
+    # radius 2.575 m; if it was the outer front wheel's track, the centre
+    # radius is 1.66 m and the lock 39 deg - either way beyond what the steer
+    # MCU can command (see steering_command_gain below).
+    min_turning_radius_m: 2.575
+
+    # 0.0 = derive the ROAD-WHEEL lock from min_turning_radius_m: 27.5 deg.
+    # The limit actually applied is the smaller of this and what the command
+    # range can express PER SIDE: with the offset and table below, 143 deg of
+    # command is 19.4 deg to the right (radius 3.8 m) and 22.6 deg to the
+    # left (radius 3.2 m); it was 11.7 / 15.2 deg at the 99 deg limit.
+    # The node logs the reduction at startup.
+    max_steering_angle_deg: 0.0
+
+    # ---- ROAD WHEEL -> /target_angle ------------------------------------
+    # The controllers compute a road-wheel angle; the steer Teensy takes a
+    # column-side angle: encoder / 2.62. Measured on the 0912_2 drive (encoder
+    # against the road-wheel angle implied by IMU yaw rate and RTK speed):
+    # 8.0 command rad per road-wheel rad, 6.4-9.3 across 15-80 deg of command
+    # (fit residual 0.4 deg). Until 2026-09-19 this was a "steering_sign" of
+    # 2.0 in path_tracking.yaml, i.e. the road wheel got a quarter of what the
+    # controller asked for. Re-measure after any change to the steering drive.
+    steering_command_gain: 8.0
+    # Command <-> tyre angle, CENTRED on steering_command_offset_rad below
+    # (i.e. the encoder reading minus the offset). When present it REPLACES
+    # steering_command_gain.
+    #
+    # 2026-09-23, from the bag stanley_tuning_0922_235531 (the first full
+    # lap): the four inner rows are the equivalent bicycle angle measured as
+    # atan(wheelbase * yaw_rate / speed) while the encoder sat in a band
+    # (+/-1.73 rad = the 99 deg command limit, 1100+ samples each; +/-1.0 rad,
+    # 200 samples each), split into left/right tyre angles with Ackermann
+    # (cot_outer - cot_inner = track / wheelbase). The two ends are the
+    # 2026-09-19 hand measurement (-2.71 / +2.75 raw, assumed on the same
+    # encoder zero as today, which makes the table nearly symmetric:
+    # 7.7-7.8 deg/rad near the centre on both sides, 8.5-8.6 at the ends).
+    #
+    # Before this the table was the two hand-measured ends with straight
+    # lines to 0, on a raw (uncentred) encoder; it said 13.7 deg to the right
+    # at full command where the vehicle really turns 11.7 (R 6.5 m, not 5.5).
+    # Re-measure after any change to the steering drive or its zero.
+    steering_table_encoder_rad:    [-2.50, -1.52, -0.78, 0.0, 1.21, 1.94, 2.96]
+    steering_table_right_tire_deg: [-22.0, -12.7,  -6.1, 0.0,  9.1, 13.8, 22.0]
+    steering_table_left_tire_deg:  [-21.0, -10.8,  -5.6, 0.0, 10.4, 17.0, 29.0]
+    # Encoder reading (rad) at which the road wheels are STRAIGHT. The Teensy
+    # zero (/steering_center) is set per session, so this is per session too.
+    # 2026-09-23: -0.210 rad (median of 1553 samples driving straight above
+    # 1.5 m/s with |yaw rate| < 1 deg/s; p25/p75 -0.26/-0.135). Until then it
+    # was 0.0 and the wheels were ~1.6 deg left whenever Stanley asked for 0.
+    # Re-measure after every /steering_center: the median /encoder while
+    # driving straight. 0912_2 needed +0.08.
+    # 2026-10-07: -0.21 -> 0.0. /steering_center를 바퀴 직진 상태에서 다시 잡아
+    # 엔코더가 0.0을 읽음(사용자 확인). 이전 -0.21은 9/23 세션 값이었고, 영점이
+    # -1.87로 밀린 채 달리자 "직진"이 13° 왼쪽이 되어 차가 계속 왼쪽으로 갔음.
+    steering_command_offset_rad: 0.0
+    # The vehicle PC's steer Teensy source (src/steering_teensy, 2026-09-07)
+    # REJECTS any target beyond ANGLE_LIMIT_RAD = 1.7453 (100 deg): it drops
+    # the target and stops the stepper, so the wheels freeze where they are.
+    # Clamp under it. The dev PC recorded a +/-2.5 rad (143.239 deg) firmware
+    # limit; restore 143.2394488 only after confirming the flashed firmware.
+    # Mechanical encoder endpoints are about -2.71 / +2.75 rad.
+    # Encoder and positive command both mean left.
+    # 2026-09-23: 99 -> 143.24 (+/-2.5 rad) on the user's word that the steer
+    # Teensy was reflashed with a 2.5 rad limit. NOT yet verified on the
+    # vehicle; this workspace's steering_teensy.ino still says 1.7453. If the
+    # wheels freeze in a bend, the old firmware is on the board: back to 99.
+    max_steering_command_deg: 143.2394488
+
+    # How fast the ROAD-WHEEL angle may be commanded to move (deg/s of road
+    # wheel, i.e. 8x that at the command). Pure Pursuit recomputes its angle
+    # from scratch every frame, so without this one outlier pose becomes a
+    # full-amplitude step at the actuator. The Teensy slews at its own rate
+    # underneath (unmeasured); this only keeps single-frame jumps out.
+    # 2026-09-20: 60 -> 20 on the assumption that the motor was slow.
+    # 2026-09-23: 20 -> 40, measured. stanley_tuning_0922_235531 shows the
+    # encoder following the command at up to 4.7 rad/s (about 40 deg/s of
+    # road wheel) with a 0.24 s lag; holding the command to 20 deg/s only made
+    # corner entries late.
+    max_steering_rate_deg_s: 40.0
+
+    # Rear axle relative to base_link, along base_link's +x (negative = behind).
+    # Pure Pursuit's geometry is derived AT the rear axle; 0.0 asserts that
+    # base_link already is the rear axle. Worth confirming against the URDF /
+    # static TF rather than assuming.
+    rear_axle_offset_m: 0.0

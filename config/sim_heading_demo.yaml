@@ -1,0 +1,14 @@
+# stanley_dynamics_sim.launch.py heading_demo_sec:=N - in place of
+# sim_overrides.yaml: the same vehicle-like settings, but the simulator makes
+# /ekf/heading_verified true after N s on a timer (not on the RTK course) and
+# the creep waits 3 s, so wait -> creep -> tracking is easy to watch in RViz.
+route_publisher_node:
+  ros__parameters:
+    goal_mode: "STOP_AT_END"
+stanley_node:
+  ros__parameters:
+    steering_feedback_topic: "/simulation/encoder"
+    map_heading_consistency_required: false
+    heading_verified_required: true
+    heading_creep_on_unverified: true
+    heading_creep_wait_sec: 3.0

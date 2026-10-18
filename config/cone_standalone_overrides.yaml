@@ -1,0 +1,12 @@
+# Passed as `overrides:=` to cone_avoidance_1005.launch.py by avoidance_supervisor_node
+# (real vehicle). The launch means to route the controller's output through its
+# command_guard, but its `extra` parameter dict does not take effect with the
+# default overrides file: cone_control then publishes /target_angle and
+# /target_speed itself, next to the guard's brake (seen on the vehicle
+# 2026-10-08). This file sets the controller's output topics explicitly, so
+# the guard is the only publisher of the actuator topics.
+/**:
+  ros__parameters:
+    topics:
+      steer_cmd: /cone_avoidance_1005/controller/target_angle
+      target_speed: /cone_avoidance_1005/controller/target_speed
